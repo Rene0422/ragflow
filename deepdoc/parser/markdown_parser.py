@@ -132,6 +132,40 @@ class MarkdownElementExtractor:
         toks = sorted(set(toks), key=lambda x: -len(x))
         return "|".join(re.escape(t) for t in toks if t)
 
+    def _atomic_region_ranges(self, text: str):
+        """Return [(start, end), ...] half-open char offsets of regions that
+        must not be split by a sentence-level delimiter — currently fenced
+        code blocks (``` or ~~~, any fence length >= 3) — so the
+        delimiter-driven path in extract_elements can skip over them.
+
+        Handles nested fencing correctly: the closing fence must use the
+        same fence character and have length >= the opening fence length,
+        as specified by CommonMark §4.5. Closes part of #15482.
+        """
+        ranges: list[tuple[int, int]] = []
+        fence_re = re.compile(r"(?m)^[ \t]{0,3}(?P<fence>`{3,}|~{3,})")
+        pos = 0
+        while pos < len(text):
+            m = fence_re.search(text, pos)
+            if not m:
+                break
+            open_fence = m.group("fence")
+            open_char = open_fence[0]
+            open_len = len(open_fence)
+            close_re = re.compile(
+                rf"(?m)^[ \t]{{0,3}}{re.escape(open_char)}{{{open_len},}}[ \t]*$"
+            )
+            close = close_re.search(text, m.end())
+            if close:
+                end = close.end()
+            else:
+                # Unterminated fence — treat the remainder of the doc as
+                # atomic so a stray ``` doesn't poison the delimiter pass.
+                end = len(text)
+            ranges.append((m.start(), end))
+            pos = end
+        return ranges
+
     def extract_elements(self, delimiter=None, include_meta=False):
         """Extract individual elements (headers, code blocks, lists, etc.)"""
         sections = []
@@ -142,33 +176,62 @@ class MarkdownElementExtractor:
             dels = self.get_delimiters(delimiter)
         if len(dels) > 0:
             text = "\n".join(self.lines)
-            if include_meta:
-                pattern = re.compile(dels)
-                last_end = 0
-                for m in pattern.finditer(text):
-                    part = text[last_end : m.start()]
-                    if part and part.strip():
-                        sections.append(
-                            {
-                                "content": part.strip(),
-                                "start_line": text.count("\n", 0, last_end),
-                                "end_line": text.count("\n", 0, m.start()),
-                            }
-                        )
-                    last_end = m.end()
+            atomic_ranges = self._atomic_region_ranges(text)
+            pattern = re.compile(dels)
 
-                part = text[last_end:]
-                if part and part.strip():
-                    sections.append(
-                        {
-                            "content": part.strip(),
-                            "start_line": text.count("\n", 0, last_end),
-                            "end_line": text.count("\n", 0, len(text)),
-                        }
-                    )
-            else:
-                parts = re.split(dels, text)
-                sections = [p.strip() for p in parts if p and p.strip()]
+            def split_outside_atomics(start: int, end: int):
+                """Yield (chunk_start, chunk_end) over [start, end), splitting
+                on delimiter matches only outside atomic ranges."""
+                cursor = start
+                for m in pattern.finditer(text, start, end):
+                    if any(a <= m.start() < b for a, b in atomic_ranges):
+                        continue
+                    if m.start() > cursor:
+                        yield cursor, m.start()
+                    cursor = m.end()
+                if cursor < end:
+                    yield cursor, end
+
+            # Walk the document interleaving atomic regions (emitted whole)
+            # with delimiter-split text between them. This is the fix for
+            # the "Preserve code blocks" / "Handle nested fencing"
+            # requirements of #15482: the previous implementation was a
+            # bare re.split(dels, text) which happily split inside code
+            # blocks.
+            cursor = 0
+            boundaries = atomic_ranges + [(len(text), len(text))]
+            for a_start, a_end in boundaries:
+                # delimiter-split the text between the previous atomic end
+                # and this atomic's start
+                if a_start > cursor:
+                    for s, e in split_outside_atomics(cursor, a_start):
+                        part = text[s:e]
+                        if part and part.strip():
+                            if include_meta:
+                                sections.append(
+                                    {
+                                        "content": part.strip(),
+                                        "start_line": text.count("\n", 0, s),
+                                        "end_line": text.count("\n", 0, e),
+                                    }
+                                )
+                            else:
+                                sections.append(part.strip())
+                # emit the atomic region itself (if any)
+                if a_end > a_start:
+                    part = text[a_start:a_end]
+                    if part.strip():
+                        if include_meta:
+                            sections.append(
+                                {
+                                    "content": part.strip(),
+                                    "start_line": text.count("\n", 0, a_start),
+                                    "end_line": text.count("\n", 0, a_end),
+                                }
+                            )
+                        else:
+                            sections.append(part.strip())
+                cursor = a_end
             return sections
         while i < len(self.lines):
             line = self.lines[i]
@@ -178,8 +241,10 @@ class MarkdownElementExtractor:
                 element = self._extract_header(i)
                 sections.append(element if include_meta else element["content"])
                 i = element["end_line"] + 1
-            elif line.strip().startswith("```"):
-                # code block
+            elif re.match(r"^[ \t]{0,3}(?:`{3,}|~{3,})", line):
+                # code block — recognise both ``` and ~~~ openings of any
+                # fence length >= 3 (CommonMark §4.5). Closes part of
+                # #15482.
                 element = self._extract_code_block(i)
                 sections.append(element if include_meta else element["content"])
                 i = element["end_line"] + 1
@@ -219,11 +284,31 @@ class MarkdownElementExtractor:
         end_pos = start_pos
         content_lines = [self.lines[start_pos]]
 
-        # Find the end of the code block
+        # Match CommonMark §4.5 fenced code blocks: the closing fence must
+        # use the same fence character (` or ~) AND be at least as long
+        # as the opening fence. The previous implementation closed on the
+        # first line whose stripped form started with ``` — which is
+        # wrong for nested fencing (e.g. an outer ````python fence
+        # containing an inner ``` block would close on the inner one
+        # instead of the outer). Closes part of #15482.
+        opening = self.lines[start_pos].lstrip()
+        fence_char = opening[0] if opening and opening[0] in ("`", "~") else "`"
+        open_len = 0
+        for ch in opening:
+            if ch == fence_char:
+                open_len += 1
+            else:
+                break
+        if open_len < 3:
+            # caller already determined this line is a fence; defend
+            # against arbitrarily-short fences just in case.
+            open_len = 3
+
+        close_re = re.compile(rf"^[ \t]{{0,3}}{re.escape(fence_char)}{{{open_len},}}[ \t]*$")
         for i in range(start_pos + 1, len(self.lines)):
             content_lines.append(self.lines[i])
             end_pos = i
-            if self.lines[i].strip().startswith("```"):
+            if close_re.match(self.lines[i]):
                 break
 
         return {
@@ -288,21 +373,28 @@ class MarkdownElementExtractor:
         end_pos = start_pos
         content_lines = [self.lines[start_pos]]
 
+        # Block-start detector reused both for the current line and the
+        # one-line lookahead below. Recognises both ``` and ~~~ fences so
+        # a paragraph that runs into a tilde-fenced code block ends
+        # cleanly (closes part of #15482).
+        def _is_block_start(s: str) -> bool:
+            return bool(
+                re.match(r"^#{1,6}\s+.*$", s)
+                or re.match(r"^[ \t]{0,3}(?:`{3,}|~{3,})", s)
+                or re.match(r"^\s*[-*+]\s+.*$", s)
+                or re.match(r"^\s*\d+\.\s+.*$", s)
+                or s.strip().startswith(">")
+            )
+
         i = start_pos + 1
         while i < len(self.lines):
             line = self.lines[i]
             # stop if we encounter a block element
-            if re.match(r"^#{1,6}\s+.*$", line) or line.strip().startswith("```") or re.match(r"^\s*[-*+]\s+.*$", line) or re.match(r"^\s*\d+\.\s+.*$", line) or line.strip().startswith(">"):
+            if _is_block_start(line):
                 break
             elif not line.strip():
                 # check if the next line is a block element
-                if i + 1 < len(self.lines) and (
-                    re.match(r"^#{1,6}\s+.*$", self.lines[i + 1])
-                    or self.lines[i + 1].strip().startswith("```")
-                    or re.match(r"^\s*[-*+]\s+.*$", self.lines[i + 1])
-                    or re.match(r"^\s*\d+\.\s+.*$", self.lines[i + 1])
-                    or self.lines[i + 1].strip().startswith(">")
-                ):
+                if i + 1 < len(self.lines) and _is_block_start(self.lines[i + 1]):
                     break
                 else:
                     content_lines.append(line)
